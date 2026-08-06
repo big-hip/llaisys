@@ -281,18 +281,82 @@ void Tensor::load(const void *src_) {
 }
 
 tensor_t Tensor::contiguous() const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // 已经连续：共享 storage，无需拷贝
+    if (isContiguous()) {
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+
+    // 不连续：在相同设备上新建连续张量，按当前 strides 逐元素拷贝
+    tensor_t result = create(_meta.shape, _meta.dtype, this->deviceType(), this->deviceId());
+    const size_t n = numel();
+    const size_t es = elementSize();
+    const size_t nd = ndim();
+    const auto &shape_ = _meta.shape;
+    const auto &strides_ = _meta.strides;
+
+    // 用一个"里程表"遍历所有多维下标：dst 按行主序线性递增，
+    // src 用每个维度的下标 × stride 算出在内存里的元素偏移
+    std::vector<size_t> index(nd, 0);
+    for (size_t i = 0; i < n; i++) {
+        size_t src_elem = 0;
+        for (size_t d = 0; d < nd; d++) {
+            src_elem += index[d] * static_cast<size_t>(strides_[d]);
+        }
+        std::memcpy(result->data() + i * es, data() + src_elem * es, es);
+
+        // 下标进位（低维优先，和行主序一致）
+        for (int d = static_cast<int>(nd) - 1; d >= 0; d--) {
+            if (++index[d] < shape_[d]) {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
+    return result;
 }
 
 tensor_t Tensor::reshape(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // PyTorch 语义：连续张量 reshape 就是 view；非连续的先拷成连续再 view
+    // （view 内部会校验元素总数一致）
+    if (isContiguous()) {
+        return view(shape);
+    }
+    auto contig = contiguous();
+    return contig->view(shape);
 }
 
 tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // 目标设备就是当前设备：直接共享 storage
+    if (device_type == this->deviceType() && (device < 0 || device == this->deviceId())) {
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+
+    // 源不连续时先在同设备拷成连续，再搬过去（保证结果在目标设备上连续）
+    if (!isContiguous()) {
+        auto contig = contiguous();
+        return contig->to(device_type, device);
+    }
+
+    int target_device = (device < 0) ? 0 : device;
+    tensor_t result = create(_meta.shape, _meta.dtype, device_type, target_device);
+
+    // 按源/目标设备决定拷贝方向
+    llaisysMemcpyKind_t kind;
+    if (this->deviceType() == LLAISYS_DEVICE_CPU && device_type == LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_H2H;
+    } else if (this->deviceType() == LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_H2D;
+    } else if (device_type == LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_D2H;
+    } else {
+        kind = LLAISYS_MEMCPY_D2D;
+    }
+
+    // 在目标设备上下文里发起拷贝
+    core::context().setDevice(device_type, target_device);
+    core::context().runtime().api()->memcpy_sync(
+        result->data(), this->data(), numel() * elementSize(), kind);
+    return result;
 }
 
 } // namespace llaisys
