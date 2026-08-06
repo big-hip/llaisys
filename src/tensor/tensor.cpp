@@ -164,27 +164,120 @@ void Tensor::debug() const {
 }
 
 bool Tensor::isContiguous() const {
-    TO_BE_IMPLEMENTED();
+    size_t expected = 1;                     // 后面维度的累积乘积，从 1 开始
+    for (size_t i = _meta.shape.size(); i-- > 0;) {
+        if (_meta.strides[i] != (ptrdiff_t)expected) return false;
+        expected *= _meta.shape[i];
+    }
     return true;
 }
 
 tensor_t Tensor::permute(const std::vector<size_t> &order) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // order 必须是 0..ndim-1 的一个排列
+    CHECK_ARGUMENT(order.size() == ndim(), "permute: order size must equal ndim");
+    std::vector<bool> seen(ndim(), false);
+    for (auto idx : order) {
+        CHECK_ARGUMENT(idx < ndim(), "permute: dimension index out of range");
+        CHECK_ARGUMENT(!seen[idx], "permute: duplicate dimension index");
+        seen[idx] = true;
+    }
+
+    // 不搬数据：shape 和 strides 用同一个 order 重排，offset 不变
+    std::vector<size_t> new_shape(ndim());
+    std::vector<ptrdiff_t> new_strides(ndim());
+    for (size_t i = 0; i < ndim(); i++) {
+        new_shape[i] = _meta.shape[order[i]];
+        new_strides[i] = _meta.strides[order[i]];
+    }
+    return std::shared_ptr<Tensor>(
+        new Tensor(TensorMeta{_meta.dtype, new_shape, new_strides}, _storage, _offset));
 }
 
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // 1) 新 shape 的元素总数必须与原来一致
+    size_t new_numel = 1;
+    for (auto s : shape) {
+        new_numel *= s;
+    }
+    CHECK_ARGUMENT(new_numel == numel(), "view: new shape has a different number of elements");
+
+    // 2) 连续张量：直接换成行主序 strides，无需任何校验
+    if (isContiguous()) {
+        std::vector<ptrdiff_t> new_strides(shape.size());
+        size_t stride = 1;
+        for (size_t i = 1; i <= shape.size(); i++) {
+            new_strides[shape.size() - i] = stride;
+            stride *= shape[shape.size() - i];
+        }
+        return std::shared_ptr<Tensor>(
+            new Tensor(TensorMeta{_meta.dtype, shape, new_strides}, _storage, _offset));
+    }
+
+    // 3) 非连续张量：把旧维度划分成若干组，每组合并成一个新维度。
+    //    只有组内地址保持一致时 view 才安全：
+    //    对组内每个旧维度 t，必须满足
+    //        stride[t] == (组内 t 右侧尺寸乘积) × (组左端真实维度的 stride)
+    std::vector<ptrdiff_t> new_strides(shape.size());
+    size_t old_i = 0; // 下一个待消费的旧维度（组的左边界）
+    for (size_t j = 0; j < shape.size(); j++) {
+        if (shape[j] == 1) { // 长度为 1 的维度从不被步进，stride 无约束
+            new_strides[j] = 1;
+            continue;
+        }
+        size_t lo = old_i;
+        size_t prod = 1;
+        while (old_i < ndim() && prod < shape[j]) {
+            prod *= _meta.shape[old_i];
+            old_i++;
+        }
+        CHECK_ARGUMENT(prod == shape[j], "view: dimensions cannot be merged into the new shape");
+
+        // 组 [lo, old_i) 合并成新维度 j，新 stride 取组左端真实维度的 stride
+        size_t lo_real = lo;
+        while (lo_real < old_i && _meta.shape[lo_real] == 1) {
+            lo_real++;
+        }
+        new_strides[j] = _meta.strides[lo_real];
+
+        // 校验组内地址一致性
+        size_t flat_after = 1;
+        for (size_t t = old_i; t-- > lo;) {
+            if (_meta.shape[t] > 1) {
+                CHECK_ARGUMENT(_meta.strides[t] == static_cast<ptrdiff_t>(flat_after) * new_strides[j],
+                               "view: non-contiguous region cannot be viewed");
+            }
+            flat_after *= _meta.shape[t];
+        }
+    }
+    CHECK_ARGUMENT(old_i == ndim(), "view: new shape leaves dimensions unmatched");
+
+    return std::shared_ptr<Tensor>(
+        new Tensor(TensorMeta{_meta.dtype, shape, new_strides}, _storage, _offset));
 }
 
 tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    CHECK_ARGUMENT(dim < ndim(), "slice: dim out of range");
+    CHECK_ARGUMENT(start <= end && end <= _meta.shape[dim], "slice: invalid [start, end) range");
+
+    // 只改被切维度的大小，strides 不变（切面不影响内存排布）
+    std::vector<size_t> new_shape = _meta.shape;
+    new_shape[dim] = end - start;
+
+    // 起点前移：_offset 单位是字节、stride 单位是元素，所以要乘 elementSize()
+    size_t new_offset = _offset + start * static_cast<size_t>(_meta.strides[dim]) * elementSize();
+
+    return std::shared_ptr<Tensor>(
+        new Tensor(TensorMeta{_meta.dtype, new_shape, _meta.strides}, _storage, new_offset));
 }
 
 void Tensor::load(const void *src_) {
-    TO_BE_IMPLEMENTED();
+    // 前置：切换到本张量所在设备，之后 runtime() 才对应正确的后端
+    core::context().setDevice(this->deviceType(), this->deviceId());
+    core::context().runtime().api()->memcpy_sync(
+        this->data(),
+        src_,
+        this->numel() * this->elementSize(),
+        LLAISYS_MEMCPY_H2D);
 }
 
 tensor_t Tensor::contiguous() const {
