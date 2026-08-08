@@ -37,6 +37,9 @@ target("llaisys-device")
     set_kind("static")
     add_deps("llaisys-utils")
     add_deps("llaisys-device-cpu")
+    if has_config("nv-gpu") then
+        add_deps("llaisys-device-nvidia")
+    end
 
     set_languages("cxx17")
     set_warnings("all", "error")
@@ -83,6 +86,9 @@ target_end()
 target("llaisys-ops")
     set_kind("static")
     add_deps("llaisys-ops-cpu")
+    if has_config("nv-gpu") then
+        add_deps("llaisys-ops-nvidia")
+    end
 
     set_languages("cxx17")
     set_warnings("all", "error")
@@ -123,6 +129,10 @@ target("llaisys")
     set_warnings("all", "error")
     add_files("src/llaisys/*.cc")
     add_files("src/llaisys/models/*.cc")
+    if has_config("nv-gpu") then
+        add_linkdirs("/usr/local/cuda/lib64")
+        add_links("cudart")
+    end
     set_installdir(".")
 
     

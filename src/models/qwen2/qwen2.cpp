@@ -1,5 +1,7 @@
 #include "qwen2.hpp"
 
+#include "../../core/llaisys_core.hpp"
+
 #include "../../ops/add/op.hpp"
 #include "../../ops/argmax/op.hpp"
 #include "../../ops/embedding/op.hpp"
@@ -18,6 +20,14 @@ namespace llaisys::model {
 static tensor_t make_tensor(const std::vector<size_t> &shape, llaisysDataType_t dtype,
                             llaisysDeviceType_t device, int device_id) {
     return Tensor::create(shape, dtype, device, device_id);
+}
+
+// 用当前设备的 runtime API 拷贝内存：CPU 就是 memcpy，GPU 是 cudaMemcpy。
+// 模型里有几处直接对 data() 指针做 std::memcpy，在设备内存上会崩，必须走这里。
+static void device_memcpy(void *dst, const void *src, size_t bytes, llaisysMemcpyKind_t kind,
+                          llaisysDeviceType_t device, int device_id) {
+    core::context().setDevice(device, device_id);
+    core::context().runtime().api()->memcpy_sync(dst, src, bytes, kind);
 }
 
 Qwen2::Qwen2(const Qwen2Meta &meta, llaisysDeviceType_t device, int device_id)
@@ -82,8 +92,10 @@ void Qwen2::_ensure_capacity(size_t needed) {
         if (l < _k_cache.size()) {
             // 把旧 cache 的有效前缀搬进新 buffer
             const size_t rows = std::min(_cur_len, _capacity[l]);
-            std::memcpy(new_k[l]->data(), _k_cache[l]->data(), rows * per * es);
-            std::memcpy(new_v[l]->data(), _v_cache[l]->data(), rows * per * es);
+            device_memcpy(new_k[l]->data(), _k_cache[l]->data(), rows * per * es,
+                          LLAISYS_MEMCPY_D2D, _device, _device_id);
+            device_memcpy(new_v[l]->data(), _v_cache[l]->data(), rows * per * es,
+                          LLAISYS_MEMCPY_D2D, _device, _device_id);
         }
     }
     _k_cache = std::move(new_k);
@@ -97,13 +109,16 @@ tensor_t Qwen2::_forward(const tensor_t &x_in, size_t ntoken) {
     const auto dtype = m.dtype;
     const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
 
-    // 位置 id：当前 token 在全局序列里的位置是 [_cur_len, _cur_len + ntoken)
+    // 位置 id：当前 token 在全局序列里的位置是 [_cur_len, _cur_len + ntoken)。
+    // 先在宿主机填好再拷到设备（设备张量的 data() 不能从 host 直接写）。
     auto pos = make_tensor({ntoken}, LLAISYS_DTYPE_I64, _device, _device_id);
     {
-        int64_t *p = reinterpret_cast<int64_t *>(pos->data());
+        std::vector<int64_t> pos_h(ntoken);
         for (size_t i = 0; i < ntoken; i++) {
-            p[i] = static_cast<int64_t>(_cur_len + i);
+            pos_h[i] = static_cast<int64_t>(_cur_len + i);
         }
+        device_memcpy(pos->data(), pos_h.data(), ntoken * sizeof(int64_t),
+                      LLAISYS_MEMCPY_H2D, _device, _device_id);
     }
 
     tensor_t x = x_in;
@@ -133,8 +148,10 @@ tensor_t Qwen2::_forward(const tensor_t &x_in, size_t ntoken) {
         {
             const size_t es = utils::dsize(dtype);
             const size_t per = nkvh * dh;
-            std::memcpy(_k_cache[l]->data() + _cur_len * per * es, kr->data(), ntoken * per * es);
-            std::memcpy(_v_cache[l]->data() + _cur_len * per * es, v3->data(), ntoken * per * es);
+            device_memcpy(_k_cache[l]->data() + _cur_len * per * es, kr->data(), ntoken * per * es,
+                          LLAISYS_MEMCPY_D2D, _device, _device_id);
+            device_memcpy(_v_cache[l]->data() + _cur_len * per * es, v3->data(), ntoken * per * es,
+                          LLAISYS_MEMCPY_D2D, _device, _device_id);
         }
         auto k_view = _k_cache[l]->slice(0, 0, _cur_len + ntoken);
         auto v_view = _v_cache[l]->slice(0, 0, _cur_len + ntoken);
@@ -179,9 +196,10 @@ int64_t Qwen2::infer(const int64_t *token_ids, size_t ntoken) {
     const auto &m = _meta;
     _ensure_capacity(_cur_len + ntoken);
 
-    // embedding：token -> [ntoken, hs]
+    // embedding：token -> [ntoken, hs]；token_ids 是宿主机数组
     auto idx = make_tensor({ntoken}, LLAISYS_DTYPE_I64, _device, _device_id);
-    std::memcpy(idx->data(), token_ids, ntoken * sizeof(int64_t));
+    device_memcpy(idx->data(), token_ids, ntoken * sizeof(int64_t),
+                  LLAISYS_MEMCPY_H2D, _device, _device_id);
     auto x = make_tensor({ntoken, m.hs}, m.dtype, _device, _device_id);
     ops::embedding(x, idx, in_embed);
 
@@ -193,7 +211,10 @@ int64_t Qwen2::infer(const int64_t *token_ids, size_t ntoken) {
     auto max_val = make_tensor({1}, m.dtype, _device, _device_id);
     ops::argmax(max_idx, max_val, last);
 
-    const int64_t next = reinterpret_cast<const int64_t *>(max_idx->data())[0];
+    // argmax 结果在设备上，先拷回宿主机再返回
+    int64_t next = 0;
+    device_memcpy(&next, max_idx->data(), sizeof(int64_t),
+                  LLAISYS_MEMCPY_D2H, _device, _device_id);
     _cur_len += ntoken;
     return next;
 }
